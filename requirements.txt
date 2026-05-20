@@ -1,0 +1,10 @@
+datasets
+transformers
+torch
+seqeval
+scikit-learn
+pandas
+tqdm
+huggingface_hub
+numpy
+regex

@@ -1,0 +1,10 @@
+venv/
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+outputs/
+models/
+*.pth
+env/
+/.mypy_cache

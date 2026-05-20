@@ -1,0 +1,3 @@
+{"query":"Help me check the weather in Beijing.","tools":["Weather_API"],"tool_call":{"name":"Weather_API","args":{"location":"Beijing"}},"tool_output":"Weather_API:{location: \"Beijing\", weather: \"sunny\"}","model_response":"The weather in Beijing is sunny."}
+
+{"query":"What's the population of Paris?","tools":["Wiki_API"],"tool_call":{"name":"Wiki_API","args":{"topic":"Paris"}},"tool_output":"Wiki_API:{topic: \"Paris\", population: \"2,161,000\"}","model_response":"Paris has a population of 2,161,000."}
