@@ -1,8 +1,8 @@
 """Evaluation harness for baseline hallucination detectors.
 
 Includes a simple heuristic baseline `tool_overlap` that flags tokens in the model output
-that are not present in the tool output (context), plus an optional LettuceDetect wrapper
-for span-level hallucination detection.
+that are not present in the tool output (context), plus optional LettuceDetect and
+LookBack Lens wrappers for span-level hallucination detection.
 """
 import argparse
 import os
@@ -17,6 +17,7 @@ except ModuleNotFoundError:
 
 
 DEFAULT_LETTUCE_MODEL = 'KRLabsOrg/lettucedect-base-modernbert-en-v1'
+DEFAULT_LOOKBACK_CLASSIFIER_DIR = 'models/lookback_lens'
 DATASET_FILES = ('clean.jsonl', 'contradiction.jsonl', 'overgeneration.jsonl', 'missing_tool.jsonl')
 
 
@@ -98,6 +99,42 @@ class LettuceDetectPredictor:
         return normalize_lettuce_spans(result)
 
 
+class LookBackLensPredictorWrapper:
+    """Adapter around the local LookBack Lens implementation."""
+
+    def __init__(
+        self,
+        classifier_dir=DEFAULT_LOOKBACK_CLASSIFIER_DIR,
+        lookback_model=None,
+        device=None,
+        sliding_window=None,
+        threshold=None,
+    ):
+        try:
+            from src.lookback_lens import LookBackLensPredictor
+        except ModuleNotFoundError:
+            from lookback_lens import LookBackLensPredictor
+
+        if not os.path.isdir(classifier_dir):
+            raise FileNotFoundError(
+                f"LookBack Lens classifier directory not found: {classifier_dir}. "
+                "Train one first with "
+                "`python src/train_lookback_lens.py --dataset outputs/toolace_train "
+                f"--output_dir {classifier_dir}`."
+            )
+
+        self.predictor = LookBackLensPredictor(
+            classifier_dir=classifier_dir,
+            model_name=lookback_model,
+            device=device,
+            sliding_window=sliding_window,
+            threshold=threshold,
+        )
+
+    def predict(self, example):
+        return self.predictor.predict(example)
+
+
 def normalize_lettuce_spans(result):
     if isinstance(result, dict):
         if 'hallucinations' in result:
@@ -126,7 +163,15 @@ def normalize_lettuce_spans(result):
     return merge_adjacent(pred_spans)
 
 
-def build_predictor(method, lettuce_model=DEFAULT_LETTUCE_MODEL, device=None):
+def build_predictor(
+    method,
+    lettuce_model=DEFAULT_LETTUCE_MODEL,
+    device=None,
+    lookback_classifier_dir=DEFAULT_LOOKBACK_CLASSIFIER_DIR,
+    lookback_model=None,
+    lookback_sliding_window=None,
+    lookback_threshold=None,
+):
     if method == 'tool_overlap':
         return tool_overlap_predict
     if method == 'lettucedetect':
@@ -135,16 +180,42 @@ def build_predictor(method, lettuce_model=DEFAULT_LETTUCE_MODEL, device=None):
             device=device,
         )
         return predictor.predict
+    if method == 'lookback_lens':
+        predictor = LookBackLensPredictorWrapper(
+            classifier_dir=lookback_classifier_dir,
+            lookback_model=lookback_model,
+            device=device,
+            sliding_window=lookback_sliding_window,
+            threshold=lookback_threshold,
+        )
+        return predictor.predict
     raise NotImplementedError(f'Unknown method: {method}')
 
 
-def evaluate(dataset_path, method='tool_overlap', lettuce_model=DEFAULT_LETTUCE_MODEL, device=None):
+def evaluate(
+    dataset_path,
+    method='tool_overlap',
+    lettuce_model=DEFAULT_LETTUCE_MODEL,
+    device=None,
+    lookback_classifier_dir=DEFAULT_LOOKBACK_CLASSIFIER_DIR,
+    lookback_model=None,
+    lookback_sliding_window=None,
+    lookback_threshold=None,
+):
     items = load_eval_items(dataset_path)
-    print(f'Building predictor: method={method}, model={lettuce_model}, device={device}', flush=True)
+    print(
+        f'Building predictor: method={method}, lettuce_model={lettuce_model}, '
+        f'lookback_classifier={lookback_classifier_dir}, device={device}',
+        flush=True,
+    )
     predict = build_predictor(
         method,
         lettuce_model=lettuce_model,
         device=device,
+        lookback_classifier_dir=lookback_classifier_dir,
+        lookback_model=lookback_model,
+        lookback_sliding_window=lookback_sliding_window,
+        lookback_threshold=lookback_threshold,
     )
     print('Predictor is ready. Starting evaluation...', flush=True)
     tp = 0
@@ -182,7 +253,7 @@ def main():
     parser.add_argument(
         '--method',
         default='tool_overlap',
-        choices=['tool_overlap', 'lettucedetect'],
+        choices=['tool_overlap', 'lettucedetect', 'lookback_lens'],
         help='Baseline method',
     )
     parser.add_argument(
@@ -190,13 +261,39 @@ def main():
         default=DEFAULT_LETTUCE_MODEL,
         help='Hugging Face model id or local path for LettuceDetect',
     )
-    parser.add_argument('--device', default=None, help='Device for LettuceDetect, e.g. cpu, cuda, cuda:0')
+    parser.add_argument(
+        '--lookback_classifier',
+        default=DEFAULT_LOOKBACK_CLASSIFIER_DIR,
+        help='Directory with classifier.pkl and metadata.json for LookBack Lens',
+    )
+    parser.add_argument(
+        '--lookback_model',
+        default=None,
+        help='Optional override for the LookBack Lens causal LM backbone',
+    )
+    parser.add_argument(
+        '--lookback_sliding_window',
+        type=int,
+        default=None,
+        help='Optional override for the LookBack Lens sliding window size',
+    )
+    parser.add_argument(
+        '--lookback_threshold',
+        type=float,
+        default=None,
+        help='Optional override for the LookBack Lens hallucination probability threshold',
+    )
+    parser.add_argument('--device', default=None, help='Device for neural baselines, e.g. cpu, cuda, cuda:0')
     args = parser.parse_args()
     evaluate(
         args.dataset,
         method=args.method,
         lettuce_model=args.lettuce_model,
         device=args.device,
+        lookback_classifier_dir=args.lookback_classifier,
+        lookback_model=args.lookback_model,
+        lookback_sliding_window=args.lookback_sliding_window,
+        lookback_threshold=args.lookback_threshold,
     )
 
 

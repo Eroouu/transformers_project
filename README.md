@@ -8,7 +8,7 @@ Overview
   - Contradiction between tool output and model response
   - Overgeneration (adds information not present in tool output)
   - Missing tool (response recommends actions requiring unavailable tools)
-- Evaluate baseline detectors (heuristic baseline and LettuceDetect provided; placeholder for LookBackLens)
+- Evaluate baseline detectors (heuristic baseline, LettuceDetect, and LookBack Lens)
 - Train a span-level token-classification model to identify hallucinated spans
 
 Quickstart
@@ -92,7 +92,7 @@ python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --met
 Run the LettuceDetect baseline:
 
 ```bash
-python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method lettucedetect
+python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method lettucedetect --device cuda
 ```
 
 By default this uses `KRLabsOrg/lettucedect-base-modernbert-en-v1`. To use another
@@ -100,6 +100,105 @@ checkpoint or force a specific device:
 
 ```bash
 python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method lettucedetect --lettuce_model KRLabsOrg/lettucedect-large-modernbert-en-v1 --device cuda
+```
+
+### LookBack Lens: training and evaluation
+
+LookBack Lens is the second required baseline from the assignment. It extracts
+**lookback ratios** from a causal LM's attention maps (how much the model attends to
+tool output vs. the answer) and trains a lightweight **logistic-regression classifier**
+to predict hallucinated spans.
+
+**Important:** LookBack Lens is not zero-shot. You must train the classifier first,
+then run evaluation with `--method lookback_lens`.
+
+Default backbone LM: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (fits on an 8 GB GPU).
+Training does **not** use epochs: the script makes one pass over the dataset to extract
+attention features, then fits the classifier once.
+
+#### Quick smoke test (recommended first)
+
+```bash
+python src/train_lookback_lens.py \
+  --dataset outputs/toolace_smoke \
+  --output_dir models/lookback_lens_smoke \
+  --device cuda \
+  --limit 8
+
+python src/eval_baselines.py \
+  --dataset outputs/toolace_smoke/contradiction.jsonl \
+  --method lookback_lens \
+  --lookback_classifier models/lookback_lens_smoke \
+  --device cuda
+```
+
+#### Full training on the train split
+
+Make sure you already generated and split the dataset (steps 2 above). Then:
+
+```bash
+python src/train_lookback_lens.py \
+  --dataset outputs/toolace_train \
+  --output_dir models/lookback_lens \
+  --device cuda
+```
+
+This saves two files in `models/lookback_lens/`:
+
+- `classifier.pkl` — trained logistic-regression classifier
+- `metadata.json` — backbone model name, sliding window size, threshold
+
+The causal LM itself is **not** saved; it is reloaded from Hugging Face during
+evaluation using the name stored in `metadata.json`.
+
+Useful training flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--model` | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Causal LM for attention extraction |
+| `--sliding_window` | `8` | Token window size for span classification |
+| `--threshold` | `0.5` | Hallucination probability threshold |
+| `--limit` | none | Cap examples for a quick debug run |
+| `--device` | `auto` | `cuda`, `cpu`, or `auto` |
+
+#### Evaluation on the test split
+
+Evaluate on one corruption type:
+
+```bash
+python src/eval_baselines.py \
+  --dataset outputs/toolace_test/contradiction.jsonl \
+  --method lookback_lens \
+  --lookback_classifier models/lookback_lens \
+  --device cuda
+```
+
+Repeat for `overgeneration.jsonl`, `missing_tool.jsonl`, and `clean.jsonl`.
+
+Evaluate on all four files at once (directory loads `clean`, `contradiction`,
+`overgeneration`, and `missing_tool`):
+
+```bash
+python src/eval_baselines.py \
+  --dataset outputs/toolace_test \
+  --method lookback_lens \
+  --lookback_classifier models/lookback_lens \
+  --device cuda
+```
+
+Optional evaluation flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--lookback_classifier` | `models/lookback_lens` | Directory with `classifier.pkl` |
+| `--lookback_model` | from metadata | Override backbone LM |
+| `--lookback_sliding_window` | from metadata | Override window size |
+| `--lookback_threshold` | from metadata | Override decision threshold |
+
+Example output:
+
+```text
+Method=lookback_lens  TP=... FP=... FN=... P=... R=... F1=...
 ```
 
 4. (Optional) Train a small span-classification model:
@@ -147,12 +246,12 @@ python src/eval_baselines.py --dataset outputs/toolace_test/contradiction.jsonl 
 
 Repository structure
 - `data/` — sample ToolACE JSONL and generation script
-- `src/` — evaluation and training scripts
+- `src/` — evaluation and training scripts (`lookback_lens.py`, `train_lookback_lens.py`)
+- `models/` — saved classifiers and fine-tuned checkpoints (gitignored)
 - `experiments/` — run scripts
 - `docs/` — dataset format and design notes
 
 Next steps
-- Implement wrapper for LookBackLens
 - Run experiments and publish dataset/model on Hugging Face
 
 License: MIT
