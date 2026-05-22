@@ -8,7 +8,7 @@ Overview
   - Contradiction between tool output and model response
   - Overgeneration (adds information not present in tool output)
   - Missing tool (response recommends actions requiring unavailable tools)
-- Evaluate baseline detectors (heuristic baseline provided; placeholders for LettuceDetect and LookBackLens)
+- Evaluate baseline detectors (heuristic baseline and LettuceDetect provided; placeholder for LookBackLens)
 - Train a span-level token-classification model to identify hallucinated spans
 
 Quickstart
@@ -77,16 +77,72 @@ Validate generated datasets before training or evaluation:
 python data/validate_corrupted_datasets.py outputs/toolace
 ```
 
+Split the generated ToolACE dataset into aligned train/test folders:
+
+```bash
+python data/split_corrupted_datasets.py --input_dir outputs/toolace --train_dir outputs/toolace_train --test_dir outputs/toolace_test --test_ratio 0.2 --seed 42
+```
+
 3. Run the heuristic baseline evaluation:
 
 ```bash
 python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method tool_overlap
 ```
 
+Run the LettuceDetect baseline:
+
+```bash
+python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method lettucedetect
+```
+
+By default this uses `KRLabsOrg/lettucedect-base-modernbert-en-v1`. To use another
+checkpoint or force a specific device:
+
+```bash
+python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method lettucedetect --lettuce_model KRLabsOrg/lettucedect-large-modernbert-en-v1 --device cuda
+```
+
 4. (Optional) Train a small span-classification model:
 
 ```bash
 python src/train_span_model.py --dataset outputs/toolace/contradiction.jsonl --output_dir models/span_model
+```
+
+Fine-tune a LettuceDetect-compatible model on the generated datasets:
+
+```bash
+python src/train_lettucedetect.py --dataset outputs/toolace --output_dir models/lettucedetect_toolace --device cuda --fp16 --batch_size 1 --gradient_accumulation_steps 8 --gradient_checkpointing
+```
+
+Evaluate the fine-tuned checkpoint with the LettuceDetect baseline wrapper:
+
+```bash
+python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method lettucedetect --lettuce_model models/lettucedetect_toolace --device cuda
+```
+
+Train on the aligned ToolACE train split used in the latest experiment:
+
+```bash
+python src/train_lettucedetect.py --dataset outputs/toolace_train --output_dir models/lettucedetect_toolace_train_eval_fast --device cuda --fp16 --batch_size 1 --eval_batch_size 2 --gradient_accumulation_steps 4
+```
+
+Evaluate the checkpoint on the full held-out test directory:
+
+```bash
+python src/eval_baselines.py --dataset outputs/toolace_test --method lettucedetect --lettuce_model models/lettucedetect_toolace_train_eval_fast --device cuda
+```
+
+Latest local result on `outputs/toolace_test`:
+
+```text
+Loaded 1092 examples from outputs/toolace_test
+Method=lettucedetect  TP=796 FP=32 FN=23 P=0.9614 R=0.9719 F1=0.9666
+```
+
+The evaluation script also accepts a single JSONL file, for example:
+
+```bash
+python src/eval_baselines.py --dataset outputs/toolace_test/contradiction.jsonl --method lettucedetect --lettuce_model models/lettucedetect_toolace_train_eval_fast --device cuda
 ```
 
 Repository structure
@@ -96,7 +152,7 @@ Repository structure
 - `docs/` — dataset format and design notes
 
 Next steps
-- Implement wrappers for LettuceDetect and LookBackLens
+- Implement wrapper for LookBackLens
 - Run experiments and publish dataset/model on Hugging Face
 
 License: MIT

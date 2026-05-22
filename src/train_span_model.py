@@ -9,6 +9,7 @@ import json
 from typing import List
 
 from datasets import Dataset
+from tqdm.auto import tqdm
 from transformers import (
     AutoTokenizer,
     AutoModelForTokenClassification,
@@ -47,7 +48,10 @@ def char_spans_to_token_labels(example, tokenizer, max_length=512):
 
 def convert_dataset(items: List[dict], tokenizer_name='bert-base-uncased'):
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
-    features = [char_spans_to_token_labels(ex, tokenizer) for ex in items]
+    features = [
+        char_spans_to_token_labels(ex, tokenizer)
+        for ex in tqdm(items, desc='Tokenizing examples', unit='example')
+    ]
     return Dataset.from_list(features), tokenizer
 
 
@@ -67,9 +71,11 @@ def main():
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         per_device_train_batch_size=8,
-        num_train_epochs=1,
+        num_train_epochs=4,
         logging_steps=10,
+        logging_strategy='steps',
         save_strategy='no',
+        disable_tqdm=False,
     )
 
     trainer = Trainer(

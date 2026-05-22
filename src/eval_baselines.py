@@ -1,18 +1,42 @@
 """Evaluation harness for baseline hallucination detectors.
 
 Includes a simple heuristic baseline `tool_overlap` that flags tokens in the model output
-that are not present in the tool output (context). This script also provides a place
-to add wrappers for LettuceDetect and LookBackLens.
+that are not present in the tool output (context), plus an optional LettuceDetect wrapper
+for span-level hallucination detection.
 """
 import argparse
-import json
+import os
 import re
-from collections import Counter
+
+from tqdm.auto import tqdm
 
 try:
     from src.utils import read_jsonl, token_spans, spans_overlap, merge_adjacent
 except ModuleNotFoundError:
     from utils import read_jsonl, token_spans, spans_overlap, merge_adjacent
+
+
+DEFAULT_LETTUCE_MODEL = 'KRLabsOrg/lettucedect-base-modernbert-en-v1'
+DATASET_FILES = ('clean.jsonl', 'contradiction.jsonl', 'overgeneration.jsonl', 'missing_tool.jsonl')
+
+
+def load_eval_items(dataset_path):
+    if os.path.isdir(dataset_path):
+        items = []
+        loaded_files = []
+        for name in DATASET_FILES:
+            path = os.path.join(dataset_path, name)
+            if not os.path.exists(path):
+                raise FileNotFoundError(f'Missing dataset file in directory: {path}')
+            file_items = read_jsonl(path)
+            items.extend(file_items)
+            loaded_files.append(f'{name}={len(file_items)}')
+        print(f"Loaded {len(items)} examples from {dataset_path} ({', '.join(loaded_files)})", flush=True)
+        return items
+
+    items = read_jsonl(dataset_path)
+    print(f'Loaded {len(items)} examples from {dataset_path}', flush=True)
+    return items
 
 
 def tool_overlap_predict(example):
@@ -38,18 +62,98 @@ def tool_overlap_predict(example):
     return pred_spans
 
 
-def evaluate(dataset_path, method='tool_overlap'):
-    items = read_jsonl(dataset_path)
+class LettuceDetectPredictor:
+    """Thin adapter around the official lettucedetect package.
+
+    The package returns span dictionaries for the response. This adapter normalizes
+    possible key variants into the `(start, end)` tuples used by the local evaluator.
+    """
+
+    def __init__(self, model_name=DEFAULT_LETTUCE_MODEL, device=None):
+        try:
+            from lettucedetect.models.inference import HallucinationDetector
+        except ImportError as exc:
+            raise ImportError(
+                "LettuceDetect is not installed. Install project requirements with "
+                "`pip install -r requirements.txt`, or install it directly with "
+                "`pip install lettucedetect`."
+            ) from exc
+
+        kwargs = {'method': 'transformer', 'model_path': model_name}
+        if device is not None:
+            kwargs['device'] = device
+        self.detector = HallucinationDetector(**kwargs)
+
+    def predict(self, example):
+        context = example.get('context') or example.get('tool_output') or ''
+        question = example.get('query') or ''
+        answer = example.get('output') or example.get('model_response') or ''
+
+        result = self.detector.predict(
+            context=[context],
+            question=question,
+            answer=answer,
+            output_format='spans',
+        )
+        return normalize_lettuce_spans(result)
+
+
+def normalize_lettuce_spans(result):
+    if isinstance(result, dict):
+        if 'hallucinations' in result:
+            result = result['hallucinations']
+        elif 'spans' in result:
+            result = result['spans']
+        elif 'predictions' in result:
+            result = result['predictions']
+
+    if isinstance(result, list) and len(result) == 1 and isinstance(result[0], list):
+        result = result[0]
+
+    pred_spans = []
+    for span in result or []:
+        if isinstance(span, (tuple, list)) and len(span) >= 2:
+            pred_spans.append((int(span[0]), int(span[1])))
+            continue
+        if not isinstance(span, dict):
+            continue
+
+        start = span.get('start', span.get('start_char', span.get('start_index')))
+        end = span.get('end', span.get('end_char', span.get('end_index')))
+        if start is not None and end is not None:
+            pred_spans.append((int(start), int(end)))
+
+    return merge_adjacent(pred_spans)
+
+
+def build_predictor(method, lettuce_model=DEFAULT_LETTUCE_MODEL, device=None):
+    if method == 'tool_overlap':
+        return tool_overlap_predict
+    if method == 'lettucedetect':
+        predictor = LettuceDetectPredictor(
+            model_name=lettuce_model,
+            device=device,
+        )
+        return predictor.predict
+    raise NotImplementedError(f'Unknown method: {method}')
+
+
+def evaluate(dataset_path, method='tool_overlap', lettuce_model=DEFAULT_LETTUCE_MODEL, device=None):
+    items = load_eval_items(dataset_path)
+    print(f'Building predictor: method={method}, model={lettuce_model}, device={device}', flush=True)
+    predict = build_predictor(
+        method,
+        lettuce_model=lettuce_model,
+        device=device,
+    )
+    print('Predictor is ready. Starting evaluation...', flush=True)
     tp = 0
     fp = 0
     fn = 0
-    for ex in items:
+    for ex in tqdm(items, desc=f'Evaluating {method}', unit='example'):
         gold = ex.get('hallucination_labels', [])
         gold_spans = [(g['start'], g['end']) for g in gold]
-        if method == 'tool_overlap':
-            pred_spans = tool_overlap_predict(ex)
-        else:
-            raise NotImplementedError('Only tool_overlap implemented in this scaffold')
+        pred_spans = predict(ex)
 
         used = set()
         for p in pred_spans:
@@ -69,14 +173,31 @@ def evaluate(dataset_path, method='tool_overlap'):
     rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
     print(f'Method={method}  TP={tp} FP={fp} FN={fn} P={prec:.4f} R={rec:.4f} F1={f1:.4f}')
+    return {'method': method, 'tp': tp, 'fp': fp, 'fn': fn, 'precision': prec, 'recall': rec, 'f1': f1}
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dataset', required=True, help='Path to RAGTruth-style JSONL')
-    parser.add_argument('--method', default='tool_overlap', help='Baseline method')
+    parser.add_argument('--dataset', required=True, help='Path to a RAGTruth-style JSONL file or a directory with generated JSONL files')
+    parser.add_argument(
+        '--method',
+        default='tool_overlap',
+        choices=['tool_overlap', 'lettucedetect'],
+        help='Baseline method',
+    )
+    parser.add_argument(
+        '--lettuce_model',
+        default=DEFAULT_LETTUCE_MODEL,
+        help='Hugging Face model id or local path for LettuceDetect',
+    )
+    parser.add_argument('--device', default=None, help='Device for LettuceDetect, e.g. cpu, cuda, cuda:0')
     args = parser.parse_args()
-    evaluate(args.dataset, method=args.method)
+    evaluate(
+        args.dataset,
+        method=args.method,
+        lettuce_model=args.lettuce_model,
+        device=args.device,
+    )
 
 
 if __name__ == '__main__':

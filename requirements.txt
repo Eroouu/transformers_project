@@ -1,10 +1,12 @@
 datasets
 transformers
 torch
+accelerate
 seqeval
 scikit-learn
 pandas
 tqdm
 huggingface_hub
+lettucedetect
 numpy
 regex

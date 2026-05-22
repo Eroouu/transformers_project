@@ -6,7 +6,7 @@ from typing import List, Tuple
 
 def read_jsonl(path: str) -> List[dict]:
     items = []
-    with open(path, 'r', encoding='utf8') as f:
+    with open(path, 'r', encoding='utf-8-sig') as f:
         for line in f:
             s = line.strip()
             if not s:
