@@ -46,32 +46,79 @@ If PowerShell prevents running scripts, enable temporary execution with:
 Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process -Force
 ```
 
-1. Generate corrupted datasets from the sample ToolACE JSONL:
+1. Build the clean ToolACE dataset.
+
+The current pipeline first creates only clean records with all metadata needed
+for LLM patch generation: `query`, `context`, `source_output`, `available_tools`,
+`called_tools`, and empty `hallucination_labels`.
+
+From the local sample:
 
 ```bash
-python data/generate_hallucinations.py --input data/sample_toolace.jsonl --output_dir outputs
+python data/build_toolace_clean.py --input data/sample_toolace.jsonl --output_dir outputs/toolace
 ```
 
-Or load the full ToolACE dataset directly from Hugging Face:
+From Hugging Face ToolACE:
 
 ```bash
-python data/generate_hallucinations.py --hf Team-ACE/ToolACE --hf_split train --output_dir outputs/toolace
+python data/build_toolace_clean.py --hf Team-ACE/ToolACE --hf_split train --output_dir outputs/toolace
 ```
 
 For a quick smoke test on a few ToolACE examples:
 
 ```bash
-python data/generate_hallucinations.py --hf Team-ACE/ToolACE --hf_split train --limit 10 --output_dir outputs/toolace_smoke
+python data/build_toolace_clean.py --hf Team-ACE/ToolACE --hf_split train --limit 10 --output_dir outputs/toolace_smoke
 ```
 
-The generator writes four JSONL files:
+This writes:
 
 - `clean.jsonl`: original model responses with empty `hallucination_labels`
-- `contradiction.jsonl`: field-aware edits that change a tool-supported value when possible, such as a number, percentage, status, date, or weather value
-- `overgeneration.jsonl`: domain-aware unsupported facts appended to the original answer
-- `missing_tool.jsonl`: action claims that would require an unavailable or uncalled tool
 
-Each corrupted record keeps `source_output`, `corruption_type`, and `corruption_strategy` metadata so examples can be audited later.
+The old `data/generate_hallucinations.py` script is kept for legacy synthetic
+data generation, but the main pipeline uses LLM patches instead.
+
+2. Generate corrupted datasets with OpenAI patch mode.
+
+Put the API key into `.env`:
+
+```text
+OPENAI_API_KEY=your_key_here
+```
+
+Contradiction:
+
+```bash
+python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/contradiction.jsonl --corruption_type contradiction --model gpt-4o-mini --temperature 0.2 --overwrite
+```
+
+Overgeneration:
+
+```bash
+python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/overgeneration.jsonl --corruption_type overgeneration --model gpt-4o-mini --temperature 0.3 --overwrite
+```
+
+Missing tool:
+
+```bash
+python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/missing_tool.jsonl --corruption_type missing_tool --model gpt-4o-mini --temperature 0.3 --overwrite
+```
+
+For small controlled runs, use `--start` and `--end`:
+
+```bash
+python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/contradiction_0_50.jsonl --corruption_type contradiction --model gpt-4o-mini --temperature 0.2 --start 0 --end 50 --overwrite
+```
+
+For Batch API preparation, write request JSONL without sending live requests:
+
+```bash
+python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/contradiction.jsonl --corruption_type contradiction --model gpt-4o-mini --batch_input outputs/toolace/batch_contradiction.jsonl
+```
+
+The LLM returns only a local patch. Python applies the patch, computes span
+offsets, runs validators, and rejects low-quality examples instead of fixing
+them manually. Each corrupted record keeps `source_output`, `corruption_type`,
+`corruption_strategy`, `llm_model`, and `source_index` metadata.
 
 Validate generated datasets before training or evaluation:
 
