@@ -48,9 +48,12 @@ Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process -Force
 
 1. Build the clean ToolACE dataset.
 
-The current pipeline first creates only clean records with all metadata needed
-for LLM patch generation: `query`, `context`, `source_output`, `available_tools`,
-`called_tools`, and empty `hallucination_labels`.
+The current pipeline first creates only clean records for LLM patch generation.
+Each record contains `query`, `context`, `output`, `available_tools`, empty
+`hallucination_labels`, `corruption_type`, `corruption_strategy`, `source_index`,
+and `source_split`. For Hugging Face ToolACE records, `available_tools` is
+extracted from the top-level `system` prompt and any earlier `system` /
+`human_system` conversation messages.
 
 From the local sample:
 
@@ -64,6 +67,12 @@ From Hugging Face ToolACE:
 python data/build_toolace_clean.py --hf Team-ACE/ToolACE --hf_split train --output_dir outputs/toolace
 ```
 
+Windows PowerShell, from the `transformers_project` directory:
+
+```powershell
+python .\data\build_toolace_clean.py --hf Team-ACE/ToolACE --hf_split train --output_dir .\outputs\toolace
+```
+
 For a quick smoke test on a few ToolACE examples:
 
 ```bash
@@ -73,6 +82,12 @@ python data/build_toolace_clean.py --hf Team-ACE/ToolACE --hf_split train --limi
 This writes:
 
 - `clean.jsonl`: original model responses with empty `hallucination_labels`
+
+After rebuilding, spot-check that ToolACE tools were extracted:
+
+```powershell
+Get-Content .\outputs\toolace\clean.jsonl -TotalCount 1
+```
 
 The old `data/generate_hallucinations.py` script is kept for legacy synthetic
 data generation, but the main pipeline uses LLM patches instead.
@@ -109,16 +124,12 @@ For small controlled runs, use `--start` and `--end`:
 python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/contradiction_0_50.jsonl --corruption_type contradiction --model gpt-4o-mini --temperature 0.2 --start 0 --end 50 --overwrite
 ```
 
-For Batch API preparation, write request JSONL without sending live requests:
-
-```bash
-python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/contradiction.jsonl --corruption_type contradiction --model gpt-4o-mini --batch_input outputs/toolace/batch_contradiction.jsonl
-```
-
 The LLM returns only a local patch. Python applies the patch, computes span
 offsets, runs validators, and rejects low-quality examples instead of fixing
-them manually. Each corrupted record keeps `source_output`, `corruption_type`,
-`corruption_strategy`, `llm_model`, and `source_index` metadata.
+them manually. Each corrupted record keeps the same output schema across all
+corruption types: `example_id`, `query`, `context`, `output`,
+`hallucination_labels`, `available_tools`, `corruption_type`,
+`generation_method`, `source_index`, and `source_split`.
 
 Validate generated datasets before training or evaluation:
 

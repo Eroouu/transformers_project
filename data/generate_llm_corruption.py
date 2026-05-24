@@ -551,8 +551,8 @@ def build_openai_responses_body(
     else:
         system_prompt = (
             'You generate minimal missing-tool insertion patches for tool-calling dialogue data. '
-            'Return only place and new_text. Insert one short false completed-action claim after place. '
-            'The action must require an unavailable or uncalled tool. '
+            'Return only place and new_text. Insert one short offer or recommendation after place. '
+            'The action must require an unavailable tool. '
             'Do not compute offsets.'
         )
     return {
@@ -647,7 +647,11 @@ def has_assistant_action_claim(text: str) -> bool:
 
 def has_missing_tool_action_claim(text: str) -> bool:
     lowered = text.lower()
-    return any(pattern in lowered for pattern in MISSING_TOOL_ACTION_PATTERNS)
+    if has_assistant_action_claim(text):
+        return True
+    has_offer = any(marker in lowered for marker in MISSING_TOOL_OFFER_MARKERS)
+    has_action = any(action in lowered for action in MISSING_TOOL_ACTION_WORDS)
+    return has_offer and has_action
 
 
 def normalize_inserted_text(text: str) -> str:
@@ -698,7 +702,7 @@ def validate_missing_tool_text(new_text: str) -> None:
     if stripped and stripped[0] in '.,;:':
         raise ValueError('missing_tool new_text must not start with punctuation')
     if not has_missing_tool_action_claim(new_text):
-        raise ValueError(f'missing_tool new_text lacks a completed assistant action claim: {new_text!r}')
+        raise ValueError(f'missing_tool new_text lacks an unavailable tool action offer or claim: {new_text!r}')
 
 
 def contains_sensitive_context(record: dict, source_output: str) -> bool:
@@ -808,6 +812,7 @@ def build_patch_record(
     )
 
     return {
+        'example_id': record.get('example_id') or f'{corruption_type}_{index}',
         'query': record.get('query', ''),
         'context': record.get('context') or record.get('tool_output') or '',
         'output': output,
@@ -818,13 +823,11 @@ def build_patch_record(
             'type': corruption_type,
             'text': label_text,
         }],
-        'source_output': source_output,
+        'available_tools': get_available_tools(record),
         'corruption_type': corruption_type,
-        'corruption_strategy': strategy,
         'generation_method': 'openai_patch',
-        'llm_model': model,
-        'llm_provider': 'openai',
         'source_index': index,
+        'source_split': record.get('source_split', ''),
     }
 
 
@@ -860,8 +863,8 @@ def validation_retry_guidance(error_message: str) -> str:
         return (
             f'- The previous new_text failed missing-tool validation.\n'
             f'- Write one complete sentence, {MISSING_TOOL_MIN_CHARS}-{MISSING_TOOL_MAX_CHARS} characters.\n'
-            '- It must explicitly claim the assistant completed an action for the user.\n'
-            '- Use wording like "I booked...", "I sent...", "The file has been converted...", or "Your order has been placed."'
+            '- It must explicitly offer or recommend an action requiring an unavailable tool.\n'
+            '- Use wording like "Would you like me to book...", "I can send...", or "Should I schedule...?"'
         )
     if 'must appear exactly once in source_output' in error_message:
         if 'got 0' in error_message:
@@ -975,49 +978,15 @@ def generate_one(
     raise RuntimeError(f'Failed after {last_attempt} attempt(s): {last_error}') from last_error
 
 
-def build_batch_request(record: dict, index: int, args: argparse.Namespace) -> dict:
-    strategy = args.strategy or DEFAULT_STRATEGIES[args.corruption_type]
-    prompt = build_patch_prompt(
-        record,
-        corruption_type=args.corruption_type,
-        strategy=strategy,
-        max_context_chars=args.max_context_chars,
-        max_source_chars=args.max_source_chars,
-    )
-    body = build_openai_responses_body(
-        prompt=prompt,
-        corruption_type=args.corruption_type,
-        model=args.model,
-        temperature=args.temperature,
-    )
-    example_id = str(record.get('id') or record.get('example_id') or index)
-    return {
-        'custom_id': f'{example_id}_{args.corruption_type}_{index}',
-        'method': 'POST',
-        'url': '/v1/responses',
-        'body': body,
-    }
-
-
-def write_batch_requests(records: List[dict], args: argparse.Namespace) -> None:
-    output_dir = os.path.dirname(args.batch_input)
-    if output_dir:
-        os.makedirs(output_dir, exist_ok=True)
-    with open(args.batch_input, 'w', encoding='utf8') as f:
-        for offset, record in enumerate(records, start=args.start):
-            f.write(json.dumps(build_batch_request(record, offset, args), ensure_ascii=False) + '\n')
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument('--input', required=True, help='Input JSONL with query/context/source_output fields')
+    parser.add_argument('--input', required=True, help='Input clean JSONL with query/context/output fields')
     parser.add_argument('--output', required=True, help='Output JSONL for generated corrupted records')
     parser.add_argument('--corruption_type', required=True, choices=CORRUPTION_TYPES)
     parser.add_argument('--strategy', help='Strategy name to put into the prompt and output metadata')
     parser.add_argument('--model', default=DEFAULT_OPENAI_MODEL, help='OpenAI model name')
     parser.add_argument('--api_key_env', default='OPENAI_API_KEY', help='Environment variable with OpenAI API key')
     parser.add_argument('--env_file', default='.env', help='Optional .env file to load before reading API key')
-    parser.add_argument('--batch_input', help='Write OpenAI Batch API input JSONL and exit without making API calls')
     parser.add_argument('--limit', type=int, help='Maximum number of records to process')
     parser.add_argument('--start', type=int, default=0, help='Start index in input JSONL')
     parser.add_argument('--end', type=int, help='End index in input JSONL, exclusive')
@@ -1039,7 +1008,7 @@ def main() -> None:
     args = parse_args()
     load_dotenv(args.env_file)
     api_key = os.environ.get(args.api_key_env)
-    if not api_key and not args.print_prompt and not args.batch_input:
+    if not api_key and not args.print_prompt:
         raise SystemExit(f'Missing API key. Set ${args.api_key_env} first.')
 
     records = read_jsonl(args.input)
@@ -1050,11 +1019,6 @@ def main() -> None:
     selected = records[args.start:args.end]
     if args.limit is not None:
         selected = selected[:args.limit]
-
-    if args.batch_input:
-        write_batch_requests(selected, args)
-        print(f'Wrote OpenAI Batch input: {args.batch_input} requests={len(selected)} model={args.model}')
-        return
 
     if args.overwrite and os.path.exists(args.output):
         os.remove(args.output)
