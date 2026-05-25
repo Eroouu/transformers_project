@@ -25,5 +25,13 @@ Generation strategies:
 
 - `clean` keeps the original assistant answer and uses an empty label list.
 - `contradiction` parses JSON-like tool outputs, extracts scalar facts, and changes a value that appears in the assistant answer when possible. This produces tighter labels than appending generic text.
-- `overgeneration` appends a plausible but unsupported domain-specific claim.
-- `missing_tool` appends an action claim, such as booking, buying, transferring, or filing, that would require a tool call not present in the trace.
+- `overgeneration` inserts a plausible but unsupported domain-specific claim.
+- `missing_tool` inserts an action claim, such as booking, buying, transferring, or filing, that would require a tool call not present in the trace.
+
+The generator supports three modes:
+
+- `rules`: local deterministic generation.
+- `hybrid`: LLM-assisted generation with automatic fallback to rules.
+- `llm`: LLM-assisted generation only.
+
+LLM-generated records are accepted only when the returned `label_text` is an exact substring of the generated `output`, so the span offsets can be validated automatically.

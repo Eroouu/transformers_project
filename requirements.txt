@@ -2,7 +2,7 @@
 
 datasets
 transformers
-torch==2.12.0+cu126
+torch
 accelerate
 seqeval
 scikit-learn

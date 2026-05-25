@@ -19,10 +19,13 @@ import json
 import os
 import random
 import re
+import urllib.error
+import urllib.request
 from typing import Any, Dict, Iterable, List, Optional
 
 
 MIN_FACT_VALUE_LEN = 2
+OPENAI_RESPONSES_URL = 'https://api.openai.com/v1/responses'
 
 
 def load_jsonl(path: str) -> List[dict]:
@@ -36,11 +39,38 @@ def load_jsonl(path: str) -> List[dict]:
     return items
 
 
+def normalize_local_record(record: dict) -> dict:
+    if 'context' in record and 'output' in record:
+        tool_output = stringify_value(record.get('context'))
+        parsed = safe_json_loads(tool_output)
+        return {
+            'query': stringify_value(record.get('query')),
+            'tool_output': tool_output,
+            'model_response': stringify_value(record.get('source_output') or record.get('output')),
+            'tool_names': extract_tool_names(parsed, tool_output),
+        }
+    return record
+
+
 def write_jsonl(items: List[dict], path: str):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, 'w', encoding='utf8') as f:
         for it in items:
             f.write(json.dumps(it, ensure_ascii=False) + "\n")
+
+
+def first_json_object(text: str) -> Optional[dict]:
+    decoder = json.JSONDecoder()
+    for idx, ch in enumerate(text or ''):
+        if ch != '{':
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[idx:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
 
 
 def extract_field(tool_output: str, field: str):
@@ -175,6 +205,10 @@ def mutate_value(key: str, value: str) -> str:
         choices = ['en', 'es', 'fr', 'de', 'zh']
     elif any(word in lower_key for word in ('status', 'state')):
         choices = ['pending', 'completed', 'cancelled', 'active', 'inactive']
+    elif any(word in lower_key for word in ('author', 'creator', 'person', 'director')):
+        choices = ['Alex Morgan', 'Taylor Reed', 'Jordan Blake', 'Casey Brooks']
+    elif any(word in lower_key for word in ('name', 'title')):
+        choices = ['Global Market Index', 'Regional Summary', 'Updated Result', 'Reference Entry']
     elif 'date' in lower_key or re.fullmatch(r'\d{4}-\d{2}-\d{2}', value):
         return re.sub(r'\d{4}', str(random.choice([2023, 2024, 2026])), value, count=1)
     else:
@@ -184,10 +218,47 @@ def mutate_value(key: str, value: str) -> str:
     return random.choice(candidates) if candidates else value + ' updated'
 
 
+def is_good_contradiction_fact(fact: Dict[str, str]) -> bool:
+    key = fact.get('key', '').lower()
+    value = fact.get('value', '').strip()
+    if not value:
+        return False
+    if any(token in key for token in ('description', 'summary', 'overview')):
+        return False
+    if key.endswith('text') and len(value.split()) > 8:
+        return False
+    if len(value) > 80:
+        return False
+    return True
+
+
 def append_labeled_span(base: str, span_text: str, label_type: str) -> Dict[str, Any]:
     separator = ' ' if base and not base.endswith((' ', '\n')) else ''
     output = f'{base}{separator}{span_text}'
     start = output.rfind(span_text)
+    return {
+        'output': output,
+        'hallucination_labels': [{
+            'start': start,
+            'end': start + len(span_text),
+            'label': 'hallucination',
+            'type': label_type,
+            'text': span_text,
+        }],
+    }
+
+
+def insert_labeled_span(base: str, span_text: str, label_type: str) -> Dict[str, Any]:
+    if not base:
+        return append_labeled_span(base, span_text, label_type)
+    sentence_end = re.search(r'(?<=[.!?])\s+', base)
+    if sentence_end and sentence_end.end() < len(base):
+        insert_at = sentence_end.start()
+        output = f'{base[:insert_at]} {span_text}{base[insert_at:]}'
+    else:
+        result = append_labeled_span(base, span_text, label_type)
+        return result
+    start = output.find(span_text)
     return {
         'output': output,
         'hallucination_labels': [{
@@ -229,6 +300,148 @@ def infer_domain(example: dict) -> str:
     if any(word in text for word in ('tax', 'mobility', 'covid', 'population')):
         return 'public_data'
     return 'general'
+
+
+def validate_generated_span(output: str, label_text: str, label_type: str) -> Optional[Dict[str, Any]]:
+    if not output or not label_text:
+        return None
+    start = output.find(label_text)
+    if start < 0:
+        return None
+    return {
+        'output': output,
+        'hallucination_labels': [{
+            'start': start,
+            'end': start + len(label_text),
+            'label': 'hallucination',
+            'type': label_type,
+            'text': label_text,
+        }],
+    }
+
+
+def extract_response_text(response: dict) -> str:
+    if response.get('output_text'):
+        return response['output_text']
+    chunks = []
+    for item in response.get('output', []):
+        for content in item.get('content', []):
+            if content.get('type') in {'output_text', 'text'} and content.get('text'):
+                chunks.append(content['text'])
+    return ''.join(chunks)
+
+
+def call_openai_json(prompt: str, model: str, api_key: str, temperature: float) -> dict:
+    schema = {
+        'type': 'object',
+        'additionalProperties': False,
+        'properties': {
+            'output': {'type': 'string'},
+            'label_text': {'type': 'string'},
+            'strategy': {'type': 'string'},
+        },
+        'required': ['output', 'label_text', 'strategy'],
+    }
+    payload = {
+        'model': model,
+        'input': [
+            {
+                'role': 'system',
+                'content': (
+                    'You create hard span-level hallucination examples for tool-using dialogues. '
+                    'Return only valid JSON matching the requested schema. The label_text must be '
+                    'an exact contiguous substring of output.'
+                ),
+            },
+            {'role': 'user', 'content': prompt},
+        ],
+        'temperature': temperature,
+        'text': {
+            'format': {
+                'type': 'json_schema',
+                'name': 'hallucination_corruption',
+                'strict': True,
+                'schema': schema,
+            }
+        },
+    }
+    request = urllib.request.Request(
+        OPENAI_RESPONSES_URL,
+        data=json.dumps(payload).encode('utf8'),
+        headers={
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        },
+        method='POST',
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            body = response.read().decode('utf8')
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode('utf8', errors='replace')
+        raise RuntimeError(f'OpenAI API request failed: HTTP {exc.code}: {detail}') from exc
+    data = json.loads(body)
+    text = extract_response_text(data)
+    parsed = first_json_object(text)
+    if not parsed:
+        raise RuntimeError(f'OpenAI API returned non-JSON text: {text[:300]}')
+    return parsed
+
+
+def llm_prompt(example: dict, corruption_type: str) -> str:
+    facts = collect_facts(example.get('tool_output', ''))[:20]
+    instructions = {
+        'contradiction': (
+            'Create a subtle contradiction by changing one fact in the assistant answer that is grounded in the tool output. '
+            'Prefer an in-place edit of a number, date, status, entity, or categorical value. Do not append an obvious warning.'
+        ),
+        'overgeneration': (
+            'Add one plausible detail that is not present in the tool output. Make it sound like a natural part of the answer, '
+            'preferably by editing or extending an existing sentence instead of adding a repeated template.'
+        ),
+        'missing_tool': (
+            'Add one subtle claim or recommendation that would require an additional tool action that was not performed, '
+            'such as booking, buying, sending, reserving, filing, subscribing, or updating a record.'
+        ),
+    }
+    payload = {
+        'corruption_type': corruption_type,
+        'task': instructions[corruption_type],
+        'constraints': [
+            'Keep the answer fluent and close to the original style.',
+            'Change as little text as possible while making the hallucination real.',
+            'Do not use phrases like "This statement is incorrect" or "independently verified".',
+            'Return label_text as only the hallucinated span, not the whole answer.',
+            'The label_text must appear exactly as a substring of output.',
+        ],
+        'query': example.get('query', ''),
+        'tool_names': example.get('tool_names', []),
+        'tool_output': example.get('tool_output', ''),
+        'assistant_answer': example.get('model_response', ''),
+        'extracted_tool_facts': facts,
+        'return_json_shape': {
+            'output': 'full corrupted assistant answer',
+            'label_text': 'exact hallucinated substring in output',
+            'strategy': 'short strategy name',
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def make_llm_corruption(example: dict, corruption_type: str, model: str, temperature: float) -> Optional[dict]:
+    api_key = os.environ.get('OPENAI_API_KEY')
+    if not api_key:
+        raise RuntimeError('OPENAI_API_KEY is not set')
+    generated = call_openai_json(llm_prompt(example, corruption_type), model, api_key, temperature)
+    result = validate_generated_span(
+        stringify_value(generated.get('output')),
+        stringify_value(generated.get('label_text')),
+        corruption_type,
+    )
+    if not result:
+        return None
+    strategy = generated.get('strategy') or 'llm_generated'
+    return with_common_fields(example, result, corruption_type, f'llm_{strategy}')
 
 
 def stringify_value(value: Any) -> str:
@@ -308,17 +521,20 @@ def make_contradiction(example: dict) -> dict:
     response = example.get('model_response', '')
     query = example.get('query', '')
     facts = collect_facts(tool_output)
-    response_facts = [fact for fact in facts if fact['value'] in response]
+    response_facts = [fact for fact in facts if fact['value'] in response and is_good_contradiction_fact(fact)]
 
     def contradiction_score(fact: Dict[str, str]):
         key = fact['key'].lower()
         value = fact['value']
         user_copied = value in query
         entity_key = any(token in key for token in ('location', 'topic', 'name', 'city', 'country'))
-        return (user_copied, entity_key, -len(value))
+        numeric_value = bool(re.search(r'\d', value))
+        data_key = any(token in key for token in ('value', 'change', 'price', 'population', 'weather', 'status', 'date', 'author'))
+        return (user_copied, not data_key, not numeric_value, entity_key, -len(value))
 
     response_facts.sort(key=contradiction_score)
-    fact = response_facts[0] if response_facts else (facts[0] if facts else None)
+    fallback_facts = [fact for fact in facts if is_good_contradiction_fact(fact)]
+    fact = response_facts[0] if response_facts else (fallback_facts[0] if fallback_facts else None)
 
     if fact and fact['value'] in response:
         mutated = mutate_value(fact['key'], fact['value'])
@@ -348,29 +564,77 @@ def make_contradiction(example: dict) -> dict:
 
 def make_overgeneration(example: dict) -> dict:
     extras = {
-        'finance': 'Analysts also expect this trend to continue next quarter.',
-        'weather': 'Air quality is also excellent today.',
-        'travel': 'Breakfast is included with the booking.',
-        'crypto': 'The address has already been backed up securely.',
-        'public_data': 'The dataset was refreshed earlier today.',
-        'general': 'This result has also been independently verified by a second source.',
+        'finance': [
+            'Analysts also expect this trend to continue next quarter.',
+            'Trading volume is also above its 30-day average.',
+            'The same source indicates lower volatility than last week.',
+        ],
+        'weather': [
+            'Air quality is also excellent today.',
+            'Humidity should stay comfortable through the evening.',
+            'Conditions are expected to remain stable tomorrow morning.',
+        ],
+        'travel': [
+            'Breakfast is included with the booking.',
+            'The fare also includes one checked bag.',
+            'Free cancellation is available until tomorrow.',
+        ],
+        'crypto': [
+            'The address has already been backed up securely.',
+            'The network fee is currently below the weekly average.',
+            'The wallet has also passed a recent security check.',
+        ],
+        'public_data': [
+            'The dataset was refreshed earlier today.',
+            'The agency also reports the same trend for the previous week.',
+            'The record has been cross-checked against the latest public release.',
+        ],
+        'general': [
+            'The result is also confirmed by a second source.',
+            'The latest update adds more detail to the same conclusion.',
+            'The service also marks this result as high confidence.',
+        ],
     }
-    extra = extras[infer_domain(example)]
-    result = append_labeled_span(example.get('model_response', ''), extra, 'overgeneration')
+    extra = random.choice(extras[infer_domain(example)])
+    result = insert_labeled_span(example.get('model_response', ''), extra, 'overgeneration')
     return with_common_fields(example, result, 'overgeneration', 'domain_unsupported_clause')
 
 
 def make_missing_tool(example: dict) -> dict:
     extras = {
-        'finance': 'I can go ahead and place a buy order for you now.',
-        'weather': 'I can also book a taxi for the best weather window.',
-        'travel': 'I have reserved the ticket for you.',
-        'crypto': 'I have transferred the funds to that address.',
-        'public_data': 'I have filed an official request to update the record.',
-        'general': 'I have completed the follow-up action for you.',
+        'finance': [
+            'I can go ahead and place a buy order for you now.',
+            'I can add this company to your portfolio watchlist.',
+            'I can set an automatic price alert at this level.',
+        ],
+        'weather': [
+            'I can also book a taxi for the best weather window.',
+            'I can schedule an outdoor reminder for the clearest period.',
+            'I can reserve a covered venue in case the forecast changes.',
+        ],
+        'travel': [
+            'I have reserved the ticket for you.',
+            'I can hold the room at this price.',
+            'I can complete the booking with your saved payment method.',
+        ],
+        'crypto': [
+            'I have transferred the funds to that address.',
+            'I can save this address as your default withdrawal wallet.',
+            'I can submit the transaction on-chain now.',
+        ],
+        'public_data': [
+            'I have filed an official request to update the record.',
+            'I can subscribe you to future updates from this agency.',
+            'I can submit a correction request for this entry.',
+        ],
+        'general': [
+            'I have completed the follow-up action for you.',
+            'I can save this result to your account.',
+            'I can send this result to the relevant service now.',
+        ],
     }
-    extra = extras[infer_domain(example)]
-    result = append_labeled_span(example.get('model_response', ''), extra, 'missing_tool')
+    extra = random.choice(extras[infer_domain(example)])
+    result = insert_labeled_span(example.get('model_response', ''), extra, 'missing_tool')
     return with_common_fields(example, result, 'missing_tool', 'unavailable_action_claim')
 
 
@@ -386,14 +650,42 @@ def make_clean(example: dict) -> dict:
     }
 
 
+def make_corruption(example: dict, corruption_type: str, args: argparse.Namespace) -> dict:
+    rule_generators = {
+        'contradiction': make_contradiction,
+        'overgeneration': make_overgeneration,
+        'missing_tool': make_missing_tool,
+    }
+    if args.generation_mode in {'llm', 'hybrid'}:
+        try:
+            generated = make_llm_corruption(example, corruption_type, args.llm_model, args.llm_temperature)
+            if generated:
+                return generated
+        except Exception as exc:
+            if args.generation_mode == 'llm':
+                raise
+            print(f'LLM generation failed for {corruption_type}; falling back to rules: {exc}')
+
+    return rule_generators[corruption_type](example)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--input', required=False, help='Path to ToolACE-style JSONL')
     parser.add_argument('--hf', help='HuggingFace dataset id (e.g., Team-ACE/ToolACE)')
     parser.add_argument('--hf_split', help='Optional split name to load from HF dataset (default: all splits)')
+    parser.add_argument('--offline', action='store_true', help='Load Hugging Face datasets from the local cache only')
     parser.add_argument('--limit', type=int, help='Optional maximum number of normalized examples to use')
     parser.add_argument('--output_dir', default='outputs')
     parser.add_argument('--seed', type=int, default=13, help='Random seed for deterministic corruptions')
+    parser.add_argument(
+        '--generation_mode',
+        choices=['rules', 'hybrid', 'llm'],
+        default='rules',
+        help='rules: local deterministic corruptions; hybrid: try LLM then fallback; llm: require LLM success',
+    )
+    parser.add_argument('--llm_model', default=os.environ.get('OPENAI_MODEL', 'gpt-5-mini'), help='OpenAI model for LLM generation')
+    parser.add_argument('--llm_temperature', type=float, default=0.7, help='Sampling temperature for LLM generation')
     args = parser.parse_args()
     random.seed(args.seed)
 
@@ -403,6 +695,9 @@ def main():
 
     items = []
     if args.hf:
+        if args.offline:
+            os.environ['HF_DATASETS_OFFLINE'] = '1'
+            os.environ['HF_HUB_OFFLINE'] = '1'
         try:
             from datasets import load_dataset
         except Exception as e:
@@ -428,15 +723,15 @@ def main():
                 items = items[:args.limit]
                 break
     else:
-        items = load_jsonl(args.input)
+        items = [normalize_local_record(record) for record in load_jsonl(args.input)]
         if args.limit:
             items = items[:args.limit]
     cleans, contras, overs, missings = [], [], [], []
     for ex in items:
         cleans.append(make_clean(ex))
-        contras.append(make_contradiction(ex))
-        overs.append(make_overgeneration(ex))
-        missings.append(make_missing_tool(ex))
+        contras.append(make_corruption(ex, 'contradiction', args))
+        overs.append(make_corruption(ex, 'overgeneration', args))
+        missings.append(make_corruption(ex, 'missing_tool', args))
 
     write_jsonl(cleans, os.path.join(args.output_dir, 'clean.jsonl'))
     write_jsonl(contras, os.path.join(args.output_dir, 'contradiction.jsonl'))
