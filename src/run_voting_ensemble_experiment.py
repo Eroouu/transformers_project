@@ -50,6 +50,7 @@ except ModuleNotFoundError:
 
 
 DATASET_FILES = ("clean.jsonl", "contradiction.jsonl", "overgeneration.jsonl", "missing_tool.jsonl")
+ALL_SPLITS = ("train", "tune", "test", "non_test")
 
 
 @dataclass
@@ -81,6 +82,16 @@ def parse_number_list(value: str, as_int: bool = False) -> List[float]:
     if not values:
         raise ValueError("Expected a non-empty comma-separated list.")
     return values
+
+
+def parse_split_names(value: str) -> List[str]:
+    splits = [s.strip() for s in value.split(",") if s.strip()]
+    if not splits:
+        raise ValueError("At least one prediction split must be provided.")
+    invalid = [s for s in splits if s not in ALL_SPLITS]
+    if invalid:
+        raise ValueError(f"Unknown split names: {invalid}. Valid splits: {list(ALL_SPLITS)}")
+    return splits
 
 
 def resolve_output_dir(base_output: str | None, seed: int) -> Path:
@@ -280,18 +291,25 @@ def train_lookback_on_non_test(
         device=device,
         max_length=max_length,
     )
-    bundle = train_classifier(
+    trained = train_classifier(
         tqdm((ex.item for ex in non_test_examples), total=len(non_test_examples), desc="Training LookBack Lens"),
         extractor=extractor,
         sliding_window=sliding_window,
         threshold=threshold,
     )
+    # Compatibility: some project revisions return (bundle, training_stats).
+    bundle = trained[0] if isinstance(trained, tuple) else trained
+    if not hasattr(bundle, "save"):
+        raise TypeError(
+            "Unexpected return value from train_classifier; expected bundle or (bundle, stats)."
+        )
     bundle.save(classifier_dir)
 
 
 def generate_predictions(
     method: str,
     examples_by_split: Dict[str, List[ExampleRecord]],
+    prediction_splits: Sequence[str],
     lettuce_model: str,
     device: str | None,
     lookback_classifier_dir: str,
@@ -309,8 +327,9 @@ def generate_predictions(
         lookback_threshold=lookback_threshold,
     )
 
-    results: Dict[str, Dict[str, List[Tuple[int, int]]]] = {"train": {}, "tune": {}, "test": {}, "non_test": {}}
-    for split_name, split_examples_ in examples_by_split.items():
+    results: Dict[str, Dict[str, List[Tuple[int, int]]]] = {split_name: {} for split_name in prediction_splits}
+    for split_name in prediction_splits:
+        split_examples_ = examples_by_split[split_name]
         for ex in tqdm(split_examples_, desc=f"Predicting {method} on {split_name}", unit="example"):
             output_text = ex.item.get("output") or ex.item.get("model_response") or ""
             raw = predictor(ex.item)
@@ -403,9 +422,11 @@ def check_prediction_counts(
     methods: Sequence[str],
     examples_by_split: Dict[str, List[ExampleRecord]],
     prediction_store: Dict[str, Dict[str, Dict[str, List[Tuple[int, int]]]]],
+    prediction_splits: Sequence[str],
 ):
     for method in methods:
-        for split_name, split_examples_ in examples_by_split.items():
+        for split_name in prediction_splits:
+            split_examples_ = examples_by_split[split_name]
             n_examples = len(split_examples_)
             n_preds = len(prediction_store[method][split_name])
             if n_examples != n_preds:
@@ -471,11 +492,13 @@ def save_prediction_artifacts(
     methods: Sequence[str],
     examples_by_split: Dict[str, List[ExampleRecord]],
     baseline_predictions: Dict[str, Dict[str, Dict[str, List[Tuple[int, int]]]]],
+    prediction_splits: Sequence[str],
 ):
     pred_dir = output_dir / "predictions"
     pred_dir.mkdir(parents=True, exist_ok=True)
     for method in methods:
-        for split_name, split_examples_ in examples_by_split.items():
+        for split_name in prediction_splits:
+            split_examples_ = examples_by_split[split_name]
             path = pred_dir / f"{method}_{split_name}.jsonl"
             with path.open("w", encoding="utf8") as f:
                 for ex in split_examples_:
@@ -527,6 +550,11 @@ def main():
     parser.add_argument("--output_dir", default=None, help="Default: outputs/ensemble_voting/run_<timestamp>_seed<seed>")
     parser.add_argument("--limit_per_file", type=int, default=None, help="Use first N rows per file for smoke tests.")
     parser.add_argument(
+        "--prediction_splits",
+        default="train,tune,test,non_test",
+        help="Comma-separated splits for baseline prediction artifacts/inference.",
+    )
+    parser.add_argument(
         "--weight_values",
         default="1,2",
         help="Comma-separated integer grid for method weights, e.g. 1,2 or 1,2,3",
@@ -541,6 +569,11 @@ def main():
     methods = parse_methods(args.methods)
     weight_values = parse_number_list(args.weight_values, as_int=True)
     threshold_values = None if args.threshold_values is None else parse_number_list(args.threshold_values, as_int=False)
+    prediction_splits = parse_split_names(args.prediction_splits)
+    required_splits = {"tune", "test"}
+    missing_required = sorted(required_splits.difference(prediction_splits))
+    if missing_required:
+        raise ValueError(f"--prediction_splits must include tune,test. Missing: {missing_required}")
     output_dir = resolve_output_dir(args.output_dir, args.seed)
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -592,6 +625,7 @@ def main():
         baseline_predictions[method] = generate_predictions(
             method=method,
             examples_by_split=examples_by_split,
+            prediction_splits=prediction_splits,
             lettuce_model=args.lettuce_model,
             device=method_device,
             lookback_classifier_dir=str(lookback_classifier_dir),
@@ -601,13 +635,14 @@ def main():
         )
 
     print("Running consistency checks (prediction counts, span roundtrip, metric parity)...")
-    check_prediction_counts(methods, examples_by_split, baseline_predictions)
+    check_prediction_counts(methods, examples_by_split, baseline_predictions, prediction_splits=prediction_splits)
+    mask_examples = examples_by_split["tune"] + examples_by_split["test"]
     method_masks: Dict[str, Dict[str, np.ndarray]] = {}
     for method in methods:
         all_preds_for_method: Dict[str, List[Tuple[int, int]]] = {}
-        for split_name in ("train", "tune", "test", "non_test"):
+        for split_name in prediction_splits:
             all_preds_for_method.update(baseline_predictions[method][split_name])
-        method_masks[method] = build_masks_for_method_predictions(examples, all_preds_for_method)
+        method_masks[method] = build_masks_for_method_predictions(mask_examples, all_preds_for_method)
     check_mask_roundtrip(method_masks)
 
     # Metric parity check against eval_baselines.py using tool_overlap on tune split.
@@ -618,6 +653,7 @@ def main():
         on_the_fly = generate_predictions(
             method="tool_overlap",
             examples_by_split={"tune": examples_by_split["tune"]},
+            prediction_splits=("tune",),
             lettuce_model=args.lettuce_model,
             device=args.device,
             lookback_classifier_dir=str(lookback_classifier_dir),
@@ -662,6 +698,7 @@ def main():
         "tune_ratio": args.tune_ratio,
         "weight_values": [int(v) for v in weight_values],
         "threshold_values": threshold_values,
+        "prediction_splits": list(prediction_splits),
         "split_row_counts": {k: len(v) for k, v in split_indices.items()},
         "split_example_counts": {k: len(v) for k, v in examples_by_split.items()},
         "ensemble_tuning": tuned,
@@ -721,7 +758,13 @@ def main():
         },
         output_dir / "split_indices.json",
     )
-    save_prediction_artifacts(output_dir, methods, examples_by_split, baseline_predictions)
+    save_prediction_artifacts(
+        output_dir,
+        methods,
+        examples_by_split,
+        baseline_predictions,
+        prediction_splits=prediction_splits,
+    )
 
     # Save ensemble test predictions too.
     ensemble_pred_path = output_dir / "predictions" / "ensemble_weighted_vote_test.jsonl"
@@ -735,12 +778,17 @@ def main():
     save_metrics_csv(per_type_rows, output_dir / "metrics_by_type.csv")
     save_metrics_csv(comparison_rows, output_dir / "baseline_vs_ensemble_comparison.csv")
 
-    print("\nTest Metrics (overall)")
-    for row in overall_rows:
-        print(
-            f"{row['model']:>24} | TP={row['tp']:<5} FP={row['fp']:<5} FN={row['fn']:<5} "
-            f"P={row['precision']:.4f} R={row['recall']:.4f} F1={row['f1']:.4f}"
-        )
+    print("\nEnsemble Metrics (run_eval format)")
+    print("method\ttp\tfp\tfn\tprecision\trecall\tf1")
+    print(
+        "ensemble_weighted_vote\t"
+        f"{int(ensemble_metrics['tp'])}\t"
+        f"{int(ensemble_metrics['fp'])}\t"
+        f"{int(ensemble_metrics['fn'])}\t"
+        f"{float(ensemble_metrics['precision']):.6f}\t"
+        f"{float(ensemble_metrics['recall']):.6f}\t"
+        f"{float(ensemble_metrics['f1']):.6f}"
+    )
 
     print(f"\nArtifacts saved to: {output_dir}")
     print("Done.")
