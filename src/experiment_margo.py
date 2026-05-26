@@ -24,8 +24,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import os
 import random
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -141,6 +139,30 @@ def answer_text(example: dict) -> str:
     return example.get("output") or example.get("model_response") or ""
 
 
+def truncate_prompt_for_answer(prompt: str, answer: str, tokenizer, max_length: int) -> str:
+    """Keep prompt short enough that answer tokens survive pair truncation."""
+    answer_ids = tokenizer(answer, add_special_tokens=False)["input_ids"]
+    special_tokens = tokenizer.num_special_tokens_to_add(pair=True)
+    max_answer_tokens = max(1, max_length // 2)
+    reserved_answer = min(len(answer_ids), max_answer_tokens)
+    prompt_max_length = max(1, max_length - reserved_answer - special_tokens)
+    prompt_ids = tokenizer(
+        prompt,
+        add_special_tokens=False,
+        truncation=True,
+        max_length=prompt_max_length,
+    )["input_ids"]
+    return tokenizer.decode(prompt_ids, skip_special_tokens=True)
+
+
+def pair_truncation_mode(answer: str, tokenizer, max_length: int):
+    answer_ids = tokenizer(answer, add_special_tokens=False)["input_ids"]
+    special_tokens = tokenizer.num_special_tokens_to_add(pair=True)
+    if len(answer_ids) <= max_length - special_tokens:
+        return "only_first"
+    return True
+
+
 def gold_spans(example: dict) -> list[tuple[int, int]]:
     spans = []
     for label in example.get("hallucination_labels", []) or []:
@@ -189,23 +211,12 @@ def tokenize_training_example(example: dict, tokenizer, max_length: int, lang: s
     prompt = make_prompt(example, lang)
     answer = answer_text(example)
     spans = gold_spans(example)
-
-    answer_ids = tokenizer(answer, add_special_tokens=False)["input_ids"]
-    max_answer_tokens = max(1, max_length // 2)
-    reserved_answer = min(len(answer_ids), max_answer_tokens)
-    prompt_max_length = max(1, max_length - reserved_answer - 3)
-    prompt_ids = tokenizer(
-        prompt,
-        add_special_tokens=False,
-        truncation=True,
-        max_length=prompt_max_length,
-    )["input_ids"]
-    prompt = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+    prompt = truncate_prompt_for_answer(prompt, answer, tokenizer, max_length)
 
     encoded = tokenizer(
         prompt,
         answer,
-        truncation=True,
+        truncation=pair_truncation_mode(answer, tokenizer, max_length),
         max_length=max_length,
         return_offsets_mapping=True,
     )
@@ -317,10 +328,11 @@ class SpanPredictor:
     def token_scores(self, example: dict) -> tuple[list[tuple[int, int]], np.ndarray]:
         prompt = make_prompt(example, self.config.lang)
         answer = answer_text(example)
+        prompt = truncate_prompt_for_answer(prompt, answer, self.tokenizer, self.config.max_length)
         encoded = self.tokenizer(
             prompt,
             answer,
-            truncation=True,
+            truncation=pair_truncation_mode(answer, self.tokenizer, self.config.max_length),
             max_length=self.config.max_length,
             return_offsets_mapping=True,
             return_tensors="pt",
@@ -423,7 +435,7 @@ def tune_decode_config(model_dir: Path, valid_examples: list[Example], device: s
 
     best_config = predictor.config
     best_metrics = None
-    thresholds = [round(x, 2) for x in np.linspace(0.05, 0.95, 19)]
+    thresholds = [round(x, 2) for x in np.linspace(0.01, 0.99, 99)]
     gap_values = [0, 1, 2, 4, 8]
     min_lengths = [1, 2, 4]
 
