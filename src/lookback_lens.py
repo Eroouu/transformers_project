@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import pickle
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, Sequence
 
@@ -30,6 +31,7 @@ DEFAULT_LOOKBACK_MODEL = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 DEFAULT_SLIDING_WINDOW = 8
 CLASSIFIER_FILENAME = "classifier.pkl"
 METADATA_FILENAME = "metadata.json"
+TRAINING_RESULTS_FILENAME = "training_results.json"
 
 
 @dataclass
@@ -335,12 +337,53 @@ def build_training_matrix(examples: Iterable[dict], extractor: LookbackRatioExtr
     return np.stack(features), np.array(labels, dtype=np.int64)
 
 
+def summarize_window_classification(y_true: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Summarize window-level metrics with hallucination (label 0) as the positive class."""
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    tp = int(((y_true == 0) & (y_pred == 0)).sum())
+    fp = int(((y_true == 1) & (y_pred == 0)).sum())
+    fn = int(((y_true == 0) & (y_pred == 1)).sum())
+    tn = int(((y_true == 1) & (y_pred == 1)).sum())
+    prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+    rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+    f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
+    acc = (tp + tn) / len(y_true) if len(y_true) > 0 else 0.0
+    label_counts = {
+        "hallucination": int((y_true == 0).sum()),
+        "factual": int((y_true == 1).sum()),
+    }
+    return {
+        "tp": tp,
+        "fp": fp,
+        "fn": fn,
+        "tn": tn,
+        "precision": prec,
+        "recall": rec,
+        "f1": f1,
+        "accuracy": acc,
+        "num_windows": int(len(y_true)),
+        "label_counts": label_counts,
+        "positive_label": 0,
+        "positive_label_name": "hallucination",
+    }
+
+
+def save_training_results(output_dir: str | Path, results: dict) -> Path:
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    results_path = output_path / TRAINING_RESULTS_FILENAME
+    with results_path.open("w", encoding="utf8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    return results_path
+
+
 def train_classifier(
     examples: Iterable[dict],
     extractor: LookbackRatioExtractor,
     sliding_window: int = DEFAULT_SLIDING_WINDOW,
     threshold: float = 0.5,
-) -> LookbackLensClassifierBundle:
+) -> tuple[LookbackLensClassifierBundle, dict]:
     x_train, y_train = build_training_matrix(examples, extractor, sliding_window)
     if len(set(y_train.tolist())) < 2:
         raise ValueError(
@@ -349,10 +392,17 @@ def train_classifier(
         )
     classifier = LogisticRegression(max_iter=1000, class_weight="balanced")
     classifier.fit(x_train, y_train)
+    y_pred = classifier.predict(x_train)
     config = LookbackLensConfig(
         model_name=extractor.model_name,
         sliding_window=sliding_window,
         threshold=threshold,
         max_length=extractor.max_length,
     )
-    return LookbackLensClassifierBundle(classifier=classifier, config=config)
+    training_stats = {
+        "num_training_windows": int(len(y_train)),
+        "feature_dim": int(x_train.shape[1]),
+        "classifier_classes": [int(value) for value in classifier.classes_],
+        "train_window_metrics": summarize_window_classification(y_train, y_pred),
+    }
+    return LookbackLensClassifierBundle(classifier=classifier, config=config), training_stats

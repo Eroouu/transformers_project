@@ -1,0 +1,6 @@
+{
+  "model_name": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "sliding_window": 8,
+  "threshold": 0.5,
+  "max_length": 2048
+}

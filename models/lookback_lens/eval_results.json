@@ -1,0 +1,19 @@
+{
+  "method": "lookback_lens",
+  "evaluated_at": "2026-05-25T14:59:55.171824+00:00",
+  "dataset": "final_dataset_test",
+  "device": "cuda",
+  "num_examples": 1944,
+  "metrics": {
+    "tp": 1425,
+    "fp": 2624,
+    "fn": 38,
+    "precision": 0.3519387503087182,
+    "recall": 0.974025974025974,
+    "f1": 0.5170537010159652
+  },
+  "lookback_classifier": "models/lookback_lens",
+  "lookback_model": null,
+  "lookback_sliding_window": null,
+  "lookback_threshold": 0.5
+}
