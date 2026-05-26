@@ -6,7 +6,6 @@ __pycache__/
 outputs/*
 !outputs/toolace/
 !outputs/toolace/**
-models/
 *.pth
 env/
 /.mypy_cache

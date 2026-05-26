@@ -5,8 +5,10 @@ that are not present in the tool output (context), plus optional LettuceDetect a
 LookBack Lens wrappers for span-level hallucination detection.
 """
 import argparse
+import json
 import os
 import re
+from datetime import datetime, timezone
 
 from tqdm.auto import tqdm
 
@@ -18,6 +20,7 @@ except ModuleNotFoundError:
 
 DEFAULT_LETTUCE_MODEL = 'KRLabsOrg/lettucedect-base-modernbert-en-v1'
 DEFAULT_LOOKBACK_CLASSIFIER_DIR = 'models/lookback_lens'
+EVAL_RESULTS_FILENAME = 'eval_results.json'
 DATASET_FILES = ('clean.jsonl', 'contradiction.jsonl', 'overgeneration.jsonl', 'missing_tool.jsonl')
 
 
@@ -192,6 +195,68 @@ def build_predictor(
     raise NotImplementedError(f'Unknown method: {method}')
 
 
+def resolve_lookback_threshold(classifier_dir, override):
+    if override is not None:
+        return override
+    metadata_path = os.path.join(classifier_dir, 'metadata.json')
+    if os.path.exists(metadata_path):
+        with open(metadata_path, 'r', encoding='utf8') as f:
+            return json.load(f).get('threshold')
+    return None
+
+
+def save_eval_results(results_path, results):
+    os.makedirs(os.path.dirname(results_path) or '.', exist_ok=True)
+    with open(results_path, 'w', encoding='utf8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+    return results_path
+
+
+def resolve_eval_results_path(method, dataset_path, lookback_classifier_dir, results_path=None):
+    if results_path is not None:
+        return results_path
+    if method == 'lookback_lens':
+        return os.path.join(lookback_classifier_dir, EVAL_RESULTS_FILENAME)
+    return None
+
+
+def build_eval_results_document(
+    metrics,
+    *,
+    dataset_path,
+    method,
+    device=None,
+    lettuce_model=None,
+    lookback_classifier_dir=None,
+    lookback_model=None,
+    lookback_sliding_window=None,
+    lookback_threshold=None,
+):
+    document = {
+        'method': method,
+        'evaluated_at': datetime.now(timezone.utc).isoformat(),
+        'dataset': dataset_path,
+        'device': device,
+        'num_examples': metrics['num_examples'],
+        'metrics': {
+            'tp': metrics['tp'],
+            'fp': metrics['fp'],
+            'fn': metrics['fn'],
+            'precision': metrics['precision'],
+            'recall': metrics['recall'],
+            'f1': metrics['f1'],
+        },
+    }
+    if method == 'lettucedetect':
+        document['lettuce_model'] = lettuce_model
+    if method == 'lookback_lens':
+        document['lookback_classifier'] = lookback_classifier_dir
+        document['lookback_model'] = lookback_model
+        document['lookback_sliding_window'] = lookback_sliding_window
+        document['lookback_threshold'] = lookback_threshold
+    return document
+
+
 def evaluate(
     dataset_path,
     method='tool_overlap',
@@ -244,7 +309,16 @@ def evaluate(
     rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
     f1 = 2 * prec * rec / (prec + rec) if (prec + rec) > 0 else 0.0
     print(f'Method={method}  TP={tp} FP={fp} FN={fn} P={prec:.4f} R={rec:.4f} F1={f1:.4f}')
-    return {'method': method, 'tp': tp, 'fp': fp, 'fn': fn, 'precision': prec, 'recall': rec, 'f1': f1}
+    return {
+        'method': method,
+        'num_examples': len(items),
+        'tp': tp,
+        'fp': fp,
+        'fn': fn,
+        'precision': prec,
+        'recall': rec,
+        'f1': f1,
+    }
 
 
 def main():
@@ -284,8 +358,21 @@ def main():
         help='Optional override for the LookBack Lens hallucination probability threshold',
     )
     parser.add_argument('--device', default=None, help='Device for neural baselines, e.g. cpu, cuda, cuda:0')
+    parser.add_argument(
+        '--results_path',
+        default=None,
+        help='Optional path for evaluation metrics JSON. For lookback_lens defaults to '
+        f'<lookback_classifier>/{EVAL_RESULTS_FILENAME}.',
+    )
+    parser.add_argument(
+        '--no_save_results',
+        action='store_true',
+        help='Do not write evaluation metrics to a JSON file.',
+    )
     args = parser.parse_args()
-    evaluate(
+
+    effective_threshold = resolve_lookback_threshold(args.lookback_classifier, args.lookback_threshold)
+    metrics = evaluate(
         args.dataset,
         method=args.method,
         lettuce_model=args.lettuce_model,
@@ -295,6 +382,28 @@ def main():
         lookback_sliding_window=args.lookback_sliding_window,
         lookback_threshold=args.lookback_threshold,
     )
+
+    if not args.no_save_results:
+        output_path = resolve_eval_results_path(
+            args.method,
+            args.dataset,
+            args.lookback_classifier,
+            results_path=args.results_path,
+        )
+        if output_path is not None:
+            results_doc = build_eval_results_document(
+                metrics,
+                dataset_path=args.dataset,
+                method=args.method,
+                device=args.device,
+                lettuce_model=args.lettuce_model,
+                lookback_classifier_dir=args.lookback_classifier,
+                lookback_model=args.lookback_model,
+                lookback_sliding_window=args.lookback_sliding_window,
+                lookback_threshold=effective_threshold,
+            )
+            saved_path = save_eval_results(output_path, results_doc)
+            print(f'Saved evaluation results to {saved_path}', flush=True)
 
 
 if __name__ == '__main__':

@@ -1,0 +1,40 @@
+{
+  "method": "lookback_lens",
+  "trained_at": "2026-05-25T14:21:43.384985+00:00",
+  "dataset": [
+    "final_dataset_train"
+  ],
+  "output_dir": "models/lookback_lens",
+  "num_examples": 7780,
+  "num_dataset_files": 4,
+  "backbone_model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+  "sliding_window": 8,
+  "threshold": 0.5,
+  "max_length": 2048,
+  "device": "cuda",
+  "seed": 42,
+  "limit": null,
+  "num_training_windows": 1068373,
+  "feature_dim": 704,
+  "classifier_classes": [
+    0,
+    1
+  ],
+  "train_window_metrics": {
+    "tp": 79498,
+    "fp": 80095,
+    "fn": 9321,
+    "tn": 899459,
+    "precision": 0.49812961721378757,
+    "recall": 0.8950562379671017,
+    "f1": 0.6400495950276155,
+    "accuracy": 0.9163063836319338,
+    "num_windows": 1068373,
+    "label_counts": {
+      "hallucination": 88819,
+      "factual": 979554
+    },
+    "positive_label": 0,
+    "positive_label_name": "hallucination"
+  }
+}

@@ -3,6 +3,7 @@
 import argparse
 import json
 import random
+from datetime import datetime, timezone
 from pathlib import Path
 
 from tqdm.auto import tqdm
@@ -12,6 +13,7 @@ try:
         DEFAULT_LOOKBACK_MODEL,
         DEFAULT_SLIDING_WINDOW,
         LookbackRatioExtractor,
+        save_training_results,
         train_classifier,
     )
 except ModuleNotFoundError:
@@ -19,6 +21,7 @@ except ModuleNotFoundError:
         DEFAULT_LOOKBACK_MODEL,
         DEFAULT_SLIDING_WINDOW,
         LookbackRatioExtractor,
+        save_training_results,
         train_classifier,
     )
 
@@ -98,14 +101,40 @@ def main():
     )
 
     print("Extracting lookback-ratio features and training classifier...")
-    bundle = train_classifier(
+    bundle, training_stats = train_classifier(
         tqdm(items, desc="Training LookBack Lens", unit="example"),
         extractor=extractor,
         sliding_window=args.sliding_window,
         threshold=args.threshold,
     )
     bundle.save(args.output_dir)
+
+    metrics = training_stats["train_window_metrics"]
+    training_results = {
+        "method": "lookback_lens",
+        "trained_at": datetime.now(timezone.utc).isoformat(),
+        "dataset": list(args.dataset),
+        "output_dir": args.output_dir,
+        "num_examples": len(items),
+        "num_dataset_files": len(dataset_paths),
+        "backbone_model": args.model,
+        "sliding_window": args.sliding_window,
+        "threshold": args.threshold,
+        "max_length": args.max_length,
+        "device": str(extractor.device),
+        "seed": args.seed,
+        "limit": args.limit,
+        **training_stats,
+    }
+    results_path = save_training_results(args.output_dir, training_results)
+
     print(f"Saved LookBack Lens classifier to {Path(args.output_dir).resolve()}")
+    print(
+        "Train window metrics: "
+        f"TP={metrics['tp']} FP={metrics['fp']} FN={metrics['fn']} "
+        f"P={metrics['precision']:.4f} R={metrics['recall']:.4f} F1={metrics['f1']:.4f}"
+    )
+    print(f"Saved training results to {results_path.resolve()}")
 
 
 if __name__ == "__main__":
