@@ -4,20 +4,6 @@ This file is intentionally separate from the baseline scripts. It trains a
 context-aware answer-token classifier, tunes the span-decoding threshold on a
 held-out validation split, and can evaluate or export predictions.
 
-Recommended first run:
-
-python src/leaderboard_solution.py train ^
-  --dataset_dir final_dataset_train ^
-  --output_dir models/leaderboard_solution ^
-  --base_model KRLabsOrg/lettucedect-base-modernbert-en-v1 ^
-  --device cuda --fp16
-
-Then evaluate:
-
-python src/leaderboard_solution.py evaluate ^
-  --dataset final_dataset_test ^
-  --model_dir models/leaderboard_solution ^
-  --device cuda
 """
 
 from __future__ import annotations

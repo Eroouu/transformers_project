@@ -1,30 +1,54 @@
 # Hallucination Detection in Tool Calling
 
-This repository contains code to create span-level hallucination datasets for dialogues involving tool calls, evaluate baseline detectors, and provide a starter span-classification training pipeline.
+This repository builds span-level hallucination datasets for tool-calling dialogues, evaluates baseline detectors, and trains an improved span detector for the final assignment.
 
-Overview
+The task uses ToolACE-style examples with:
 
-- Generate clean and corrupted datasets from a base ToolACE JSONL file or Hugging Face ToolACE:
-  - Clean original examples with no hallucination labels
-  - Contradiction between tool output and model response
-  - Overgeneration (adds information not present in tool output)
-  - Missing tool (response recommends actions requiring unavailable tools)
-- Evaluate baseline detectors (heuristic baseline, LettuceDetect, and LookBack Lens)
-- Train a span-level token-classification model to identify hallucinated spans
+- user query
+- available tools
+- tool call and tool output
+- final assistant answer
 
-Quickstart
+The final dataset follows a RAGTruth-style schema:
 
-1. Create an environment and install dependencies:
+- `query`: user query
+- `context`: tool output
+- `output`: assistant final answer
+- `hallucination_labels`: character-level hallucination spans
+- `corruption_type`: `clean`, `contradiction`, `overgeneration`, or `missing_tool`
 
-Linux / macOS / WSL:
+## Current Artifacts
+
+The main prepared dataset is:
+
+- `final_dataset/`
+- `final_dataset_train/`
+- `final_dataset_test/`
+
+Each dataset folder contains:
+
+- `clean.jsonl`
+- `contradiction.jsonl`
+- `overgeneration.jsonl`
+- `missing_tool.jsonl`
+
+Validated final counts:
+
+| split | records per file | total records |
+| --- | ---: | ---: |
+| `final_dataset` | 2431 | 9724 |
+| `final_dataset_train` | 1945 | 7780 |
+| `final_dataset_test` | 486 | 1944 |
+
+## Setup
+
+Linux / macOS / Colab:
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Windows (PowerShell):
+Windows PowerShell:
 
 ```powershell
 python -m venv .venv
@@ -32,286 +56,176 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-Windows (Command Prompt):
-
-```cmd
-python -m venv .venv
-.\.venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-If PowerShell prevents running scripts, enable temporary execution with:
-
-```powershell
-Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope Process -Force
-```
-
-1. Build the clean ToolACE dataset.
-
-The current pipeline first creates only clean records for LLM patch generation.
-Each record contains `query`, `context`, `output`, `available_tools`, empty
-`hallucination_labels`, `corruption_type`, `corruption_strategy`, `source_index`,
-and `source_split`. For Hugging Face ToolACE records, `available_tools` is
-extracted from the top-level `system` prompt and any earlier `system` /
-`human_system` conversation messages.
-
-From the local sample:
+If `torchvision` causes a ModernBERT import error in Colab, uninstall it because this project is text-only:
 
 ```bash
-python data/build_toolace_clean.py --input data/sample_toolace.jsonl --output_dir outputs/toolace
+pip uninstall -y torchvision
 ```
 
-From Hugging Face ToolACE:
+Use forward slashes in Colab/Linux paths, for example `models/lookback_lens_final`, not `models\lookback_lens_final`.
+
+## Dataset Generation
+
+Build clean ToolACE records:
 
 ```bash
 python data/build_toolace_clean.py --hf Team-ACE/ToolACE --hf_split train --output_dir outputs/toolace
 ```
 
-Windows PowerShell, from the `transformers_project` directory:
-
-```powershell
-python .\data\build_toolace_clean.py --hf Team-ACE/ToolACE --hf_split train --output_dir .\outputs\toolace
-```
-
-For a quick smoke test on a few ToolACE examples:
-
-```bash
-python data/build_toolace_clean.py --hf Team-ACE/ToolACE --hf_split train --limit 10 --output_dir outputs/toolace_smoke
-```
-
-This writes:
-
-- `clean.jsonl`: original model responses with empty `hallucination_labels`
-
-After rebuilding, spot-check that ToolACE tools were extracted:
-
-```powershell
-Get-Content .\outputs\toolace\clean.jsonl -TotalCount 1
-```
-
-The old `data/generate_hallucinations.py` script is kept for legacy synthetic
-data generation, but the main pipeline uses LLM patches instead.
-
-2. Generate corrupted datasets with OpenAI patch mode.
-
-Put the API key into `.env`:
-
-```text
-OPENAI_API_KEY=your_key_here
-```
-
-Contradiction:
+Generate LLM-patched corruptions:
 
 ```bash
 python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/contradiction.jsonl --corruption_type contradiction --model gpt-4o-mini --temperature 0.2 --overwrite
-```
-
-Overgeneration:
-
-```bash
 python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/overgeneration.jsonl --corruption_type overgeneration --model gpt-4o-mini --temperature 0.3 --overwrite
-```
-
-Missing tool:
-
-```bash
 python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/missing_tool.jsonl --corruption_type missing_tool --model gpt-4o-mini --temperature 0.3 --overwrite
 ```
 
-For small controlled runs, use `--start` and `--end`:
+Validate a dataset folder:
 
 ```bash
-python data/generate_llm_corruption.py --input outputs/toolace/clean.jsonl --output outputs/toolace/contradiction_0_50.jsonl --corruption_type contradiction --model gpt-4o-mini --temperature 0.2 --start 0 --end 50 --overwrite
+python data/validate_corrupted_datasets.py final_dataset
+python data/validate_corrupted_datasets.py final_dataset_train
+python data/validate_corrupted_datasets.py final_dataset_test
 ```
 
-The LLM returns only a local patch. Python applies the patch, computes span
-offsets, runs validators, and rejects low-quality examples instead of fixing
-them manually. Each corrupted record keeps the same output schema across all
-corruption types: `example_id`, `query`, `context`, `output`,
-`hallucination_labels`, `available_tools`, `corruption_type`,
-`generation_method`, `source_index`, and `source_split`.
+The older `data/generate_hallucinations.py` script is kept for rule-based, hybrid, and legacy synthetic generation.
 
-Validate generated datasets before training or evaluation:
+## Baselines
+
+### Tool Overlap
+
+Simple heuristic baseline:
 
 ```bash
-python data/validate_corrupted_datasets.py outputs/toolace
+python src/eval_baselines.py --dataset final_dataset_test --method tool_overlap
 ```
 
-Split the generated ToolACE dataset into aligned train/test folders:
+### LettuceDetect
 
 ```bash
-python data/split_corrupted_datasets.py --input_dir outputs/toolace --train_dir outputs/toolace_train --test_dir outputs/toolace_test --test_ratio 0.2 --seed 42
+python src/eval_baselines.py --dataset final_dataset_test --method lettucedetect --device cuda
 ```
 
-1. Run the heuristic baseline evaluation:
+CPU fallback:
 
 ```bash
-python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method tool_overlap
+python src/eval_baselines.py --dataset final_dataset_test --method lettucedetect --device cpu
 ```
 
-Run the LettuceDetect baseline:
+### LookBack Lens
+
+LookBack Lens is not zero-shot in this repo. Train the attention-feature classifier first:
 
 ```bash
-python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method lettucedetect --device cuda
+python src/train_lookback_lens.py --dataset final_dataset_train --output_dir models/lookback_lens_final --device cuda
 ```
 
-By default this uses `KRLabsOrg/lettucedect-base-modernbert-en-v1`. To use another
-checkpoint or force a specific device:
+Then evaluate:
 
 ```bash
-python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method lettucedetect --lettuce_model KRLabsOrg/lettucedect-large-modernbert-en-v1 --device cuda
+python src/eval_baselines.py --dataset final_dataset_test --method lookback_lens --lookback_classifier models/lookback_lens_final --device cuda
 ```
 
-### LookBack Lens: training and evaluation
+## Improved Span Model
 
-LookBack Lens is the second required baseline from the assignment. It extracts
-**lookback ratios** from a causal LM's attention maps (how much the model attends to
-tool output vs. the answer) and trains a lightweight **logistic-regression classifier**
-to predict hallucinated spans.
+The improved model is implemented in:
 
-**Important:** LookBack Lens is not zero-shot. You must train the classifier first,
-then run evaluation with `--method lookback_lens`.
+- `src/finetuned_span_model.py`
 
-Default backbone LM: `TinyLlama/TinyLlama-1.1B-Chat-v1.0` (fits on an 8 GB GPU).
-Training does **not** use epochs: the script makes one pass over the dataset to extract
-attention features, then fits the classifier once.
+It fine-tunes a transformer token classifier on ToolACE-style hallucination spans. The model receives the user query, tool output, and answer, but computes loss only over answer tokens. It uses class weighting, focal loss, validation threshold tuning, and span post-processing.
 
-#### Quick smoke test (recommended first)
+Train:
 
 ```bash
-python src/train_lookback_lens.py \
-  --dataset outputs/toolace_smoke \
-  --output_dir models/lookback_lens_smoke \
+python src/finetuned_span_model.py train \
+  --dataset_dir final_dataset_train \
+  --output_dir models/finetuned_span_model \
   --device cuda \
-  --limit 8
-
-python src/eval_baselines.py \
-  --dataset outputs/toolace_smoke/contradiction.jsonl \
-  --method lookback_lens \
-  --lookback_classifier models/lookback_lens_smoke \
-  --device cuda
+  --fp16 \
+  --gradient_checkpointing
 ```
 
-#### Full training on the train split
-
-Make sure you already generated and split the dataset (steps 2 above). Then:
+Evaluate:
 
 ```bash
-python src/train_lookback_lens.py  --dataset outputs/toolace_train  --output_dir models/lookback_lens  --device cuda
+python src/finetuned_span_model.py evaluate \
+  --dataset final_dataset_test \
+  --model_dir models/finetuned_span_model \
+  --device cuda \
+  --metrics_out outputs/finetuned_span_model_metrics.json
 ```
 
-This saves two files in `models/lookback_lens/`:
-
-- `classifier.pkl` — trained logistic-regression classifier
-- `metadata.json` — backbone model name, sliding window size, threshold
-
-The causal LM itself is **not** saved; it is reloaded from Hugging Face during
-evaluation using the name stored in `metadata.json`.
-
-Useful training flags:
-
-
-| Flag               | Default                              | Description                               |
-| ------------------ | ------------------------------------ | ----------------------------------------- |
-| `--model`          | `TinyLlama/TinyLlama-1.1B-Chat-v1.0` | Causal LM for attention extraction        |
-| `--sliding_window` | `8`                                  | Token window size for span classification |
-| `--threshold`      | `0.5`                                | Hallucination probability threshold       |
-| `--limit`          | none                                 | Cap examples for a quick debug run        |
-| `--device`         | `auto`                               | `cuda`, `cpu`, or `auto`                  |
-
-
-#### Evaluation on the test split
-
-Evaluate on one corruption type:
+Evaluate one corruption type:
 
 ```bash
-python src/eval_baselines.py \
-  --dataset outputs/toolace_test/contradiction.jsonl \
-  --method lookback_lens \
-  --lookback_classifier models/lookback_lens \
-  --device cuda
+python src/finetuned_span_model.py evaluate --dataset final_dataset_test/contradiction.jsonl --model_dir models/finetuned_span_model --device cuda
+python src/finetuned_span_model.py evaluate --dataset final_dataset_test/overgeneration.jsonl --model_dir models/finetuned_span_model --device cuda
+python src/finetuned_span_model.py evaluate --dataset final_dataset_test/missing_tool.jsonl --model_dir models/finetuned_span_model --device cuda
+python src/finetuned_span_model.py evaluate --dataset final_dataset_test/clean.jsonl --model_dir models/finetuned_span_model --device cuda
 ```
 
-Repeat for `overgeneration.jsonl`, `missing_tool.jsonl`, and `clean.jsonl`.
+## Results
 
-Evaluate on all four files at once (directory loads `clean`, `contradiction`,
-`overgeneration`, and `missing_tool`):
+Evaluation is span-level. A predicted span is counted as a true positive if it overlaps a gold hallucination span. There is no span-level true-negative count because the number of non-hallucinated spans is not well-defined.
 
-```bash
-python src/eval_baselines.py --dataset outputs/toolace_test --method lookback_lens --lookback_classifier models/lookback_lens --device cuda
-```
+### Overall
 
-Optional evaluation flags:
+| model | tp | fp | fn | precision | recall | f1 | n_examples |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tool_overlap | 2099 | 13582 | 18 | 0.133900 | 0.991500 | 0.235900 | 1944 |
+| lettucedetect | 1116 | 3457 | 474 | 0.244000 | 0.701900 | 0.362200 | 1944 |
+| lookback_lens | 1425 | 2623 | 38 | 0.352000 | 0.974000 | 0.517100 | 1944 |
+| finetuned_span_model | 1376 | 113 | 90 | 0.924100 | 0.938600 | 0.931300 | 1944 |
 
+### Contradiction
 
-| Flag                        | Default                | Description                     |
-| --------------------------- | ---------------------- | ------------------------------- |
-| `--lookback_classifier`     | `models/lookback_lens` | Directory with `classifier.pkl` |
-| `--lookback_model`          | from metadata          | Override backbone LM            |
-| `--lookback_sliding_window` | from metadata          | Override window size            |
-| `--lookback_threshold`      | from metadata          | Override decision threshold     |
+| model | tp | fp | fn | precision | recall | f1 | n_examples |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ensemble_weighted_vote | 451 | 583 | 48 | 0.436170 | 0.903808 | 0.588389 | 486 |
+| lettucedetect | 376 | 823 | 121 | 0.313600 | 0.756500 | 0.443400 | 486 |
+| lookback_lens | 452 | 553 | 36 | 0.449800 | 0.926200 | 0.605500 | 486 |
+| finetuned_span_model | 403 | 42 | 86 | 0.905600 | 0.824100 | 0.863000 | 486 |
 
+### Overgeneration
 
-Example output:
+| model | tp | fp | fn | precision | recall | f1 | n_examples |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ensemble_weighted_vote | 586 | 636 | 35 | 0.479542 | 0.943639 | 0.635920 | 486 |
+| lettucedetect | 451 | 837 | 72 | 0.350200 | 0.862300 | 0.498100 | 486 |
+| lookback_lens | 487 | 615 | 1 | 0.441900 | 0.998000 | 0.612600 | 486 |
+| finetuned_span_model | 489 | 10 | 2 | 0.980000 | 0.995900 | 0.987900 | 486 |
 
-```text
-Method=lookback_lens  TP=... FP=... FN=... P=... R=... F1=...
-```
+### Missing Tool
 
-1. (Optional) Train a small span-classification model:
+| model | tp | fp | fn | precision | recall | f1 | n_examples |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| ensemble_weighted_vote | 435 | 659 | 116 | 0.397623 | 0.789474 | 0.528875 | 486 |
+| lettucedetect | 289 | 900 | 281 | 0.243100 | 0.507000 | 0.328600 | 486 |
+| lookback_lens | 486 | 621 | 1 | 0.439000 | 0.997900 | 0.609800 | 486 |
+| finetuned_span_model | 484 | 7 | 2 | 0.985700 | 0.995900 | 0.990800 | 486 |
 
-```bash
-python src/train_span_model.py --dataset outputs/toolace/contradiction.jsonl --output_dir models/span_model
-```
+### Clean
 
-Fine-tune a LettuceDetect-compatible model on the generated datasets:
+The clean split contains no gold hallucination spans. The main quantity is therefore false positives.
 
-```bash
-python src/train_lettucedetect.py --dataset outputs/toolace --output_dir models/lettucedetect_toolace --device cuda --fp16 --batch_size 1 --gradient_accumulation_steps 8 --gradient_checkpointing
-```
+| model | tp | fp | fn | n_examples |
+| --- | ---: | ---: | ---: | ---: |
+| finetuned_span_model | 0 | 54 | 0 | 486 |
 
-Evaluate the fine-tuned checkpoint with the LettuceDetect baseline wrapper:
+## Repository Structure
 
-```bash
-python src/eval_baselines.py --dataset outputs/toolace/contradiction.jsonl --method lettucedetect --lettuce_model models/lettucedetect_toolace --device cuda
-```
+- `data/`: dataset construction, corruption generation, validation, splitting, and merging
+- `src/eval_baselines.py`: baseline evaluation harness
+- `src/train_lookback_lens.py` and `src/lookback_lens.py`: LookBack Lens implementation
+- `src/train_lettucedetect.py`: LettuceDetect-compatible fine-tuning script
+- `src/finetuned_span_model.py`: improved span detector used for the final run
+- `docs/`: dataset format notes
+- `models/`: local model checkpoints, gitignored
 
-Train on the aligned ToolACE train split used in the latest experiment:
+## Next Steps
 
-```bash
-python src/train_lettucedetect.py --dataset outputs/toolace_train --output_dir models/lettucedetect_toolace_train_eval_fast --device cuda --fp16 --batch_size 1 --eval_batch_size 2 --gradient_accumulation_steps 4
-```
+- Publish the final dataset on Hugging Face.
+- Publish the fine-tuned span model on Hugging Face.
+- Add contradiction-focused training examples to improve contradiction recall.
+- Try a larger ModernBERT/LettuceDetect base model or a multi-seed ensemble for leaderboard optimization.
 
-Evaluate the checkpoint on the full held-out test directory:
-
-```bash
-python src/eval_baselines.py --dataset outputs/toolace_test --method lettucedetect --lettuce_model models/lettucedetect_toolace_train_eval_fast --device cuda
-```
-
-Latest local result on `outputs/toolace_test`:
-
-```text
-Loaded 1092 examples from outputs/toolace_test
-Method=lettucedetect  TP=796 FP=32 FN=23 P=0.9614 R=0.9719 F1=0.9666
-Method=lookback_lens  TP=799 FP=1110 FN=20 P=0.4185 R=0.9756 F1=0.5858
-```
-
-The evaluation script also accepts a single JSONL file, for example:
-
-```bash
-python src/eval_baselines.py --dataset outputs/toolace_test/contradiction.jsonl --method lettucedetect --lettuce_model models/lettucedetect_toolace_train_eval_fast --device cuda
-```
-
-Repository structure
-
-- `data/` — sample ToolACE JSONL and generation script
-- `src/` — evaluation and training scripts (`lookback_lens.py`, `train_lookback_lens.py`)
-- `models/` — saved classifiers and fine-tuned checkpoints (gitignored)
-- `experiments/` — run scripts
-- `docs/` — dataset format and design notes
-
-Next steps
-
-- Run experiments and publish dataset/model on Hugging Face
-
-License: MIT
